@@ -41,7 +41,7 @@ func TestVirtualNetworkLifecycle(t *testing.T) {
 			},
 			{
 				Config: vnetConfig(ms, "vnet-b"),
-				Check: resource.TestCheckResourceAttr("neocloud_virtual_network.test", "name", "vnet-b"),
+				Check:  resource.TestCheckResourceAttr("neocloud_virtual_network.test", "name", "vnet-b"),
 			},
 			{
 				ResourceName:      "neocloud_virtual_network.test",
