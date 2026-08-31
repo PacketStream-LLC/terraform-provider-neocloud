@@ -83,7 +83,9 @@ func (p *NeocloudProvider) Configure(ctx context.Context, req provider.Configure
 }
 
 func (p *NeocloudProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		NewVirtualNetworkResource,
+	}
 }
 
 func (p *NeocloudProvider) DataSources(_ context.Context) []func() datasource.DataSource {
