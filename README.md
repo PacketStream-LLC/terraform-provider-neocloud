@@ -4,7 +4,8 @@ Terraform provider for [PacketStream Neocloud](https://neocloud.packet.stream) I
 virtual machines, block/object storage, parallel file systems, networking, and the
 allocations that run them.
 
-- Source address: `registry.terraform.io/packetstream-llc/neocloud`
+- Terraform source address: `registry.terraform.io/packetstream-llc/neocloud`
+- Terraform Registry: [PacketStream-LLC/neocloud](https://registry.terraform.io/providers/PacketStream-LLC/neocloud)
 - Protocol: Terraform Plugin Protocol v6 (Terraform >= 1.0)
 - License: MPL-2.0
 
