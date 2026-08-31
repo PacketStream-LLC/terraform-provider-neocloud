@@ -2,11 +2,16 @@ package provider
 
 import (
 	"github.com/hashicorp/terraform-plugin-framework/provider"
+
+	"github.com/packetstream-llc/terraform-provider-neocloud/internal/client"
 )
 
-// Task 5 에서 *client.Neocloud 를 만들어 ResourceData/DataSourceData 에 싣는다.
 func (p *NeocloudProvider) configureClients(endpoint, apiKey string, resp *provider.ConfigureResponse) {
-	_ = endpoint
-	_ = apiKey
-	_ = resp
+	api, err := client.NewNeocloud(endpoint, apiKey)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to build API client", err.Error())
+		return
+	}
+	resp.ResourceData = api
+	resp.DataSourceData = api
 }
