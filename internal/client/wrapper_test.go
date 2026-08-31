@@ -74,6 +74,14 @@ func TestParseAPIErrorNonJSON(t *testing.T) {
 	}
 }
 
+func TestAPIErrorWithoutProblemTypeIncludesDetail(t *testing.T) {
+	apiErr := &APIError{Status: 0, Detail: "dial tcp: endpoint unreachable"}
+
+	if got, want := apiErr.Error(), "neocloud API error 0: dial tcp: endpoint unreachable"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestNewNeocloudSendsBearerKey(t *testing.T) {
 	var got string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -46,6 +46,9 @@ func (e *APIError) Error() string {
 	if e.Type != "" {
 		return fmt.Sprintf("neocloud API error %d (%s): %s", e.Status, e.Type, e.Detail)
 	}
+	if e.Detail != "" {
+		return fmt.Sprintf("neocloud API error %d: %s", e.Status, e.Detail)
+	}
 	return fmt.Sprintf("neocloud API error %d", e.Status)
 }
 
