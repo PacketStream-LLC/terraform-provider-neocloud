@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Neocloud 는 생성 클라이언트에 인증과 에러 해석을 얹은 얇은 래퍼다.
@@ -40,6 +42,7 @@ type APIError struct {
 	UpstreamCode       string
 	ResourceStatus     string
 	BucketWidthSeconds int
+	ChronoMagicID      string
 	validationIssues   []validationIssue
 }
 
@@ -60,6 +63,9 @@ func (e *APIError) Error() string {
 		summary = fmt.Sprintf("neocloud API error %d", e.Status)
 	}
 
+	if e.ChronoMagicID != "" {
+		summary += " Trace ID: " + e.ChronoMagicID
+	}
 	if len(e.validationIssues) == 0 {
 		return summary
 	}
@@ -98,6 +104,7 @@ func ParseAPIError(status int, body []byte) *APIError {
 	var problem struct {
 		Type             string          `json:"type"`
 		Detail           string          `json:"detail"`
+		ChronoMagicID    string          `json:"chronoMagicId"`
 		PacketstreamData json.RawMessage `json:"packetstreamData"`
 	}
 	if err := json.Unmarshal(body, &problem); err != nil {
@@ -105,6 +112,9 @@ func ParseAPIError(status int, body []byte) *APIError {
 	}
 	out.Type = problem.Type
 	out.Detail = problem.Detail
+	if traceID, err := uuid.Parse(problem.ChronoMagicID); err == nil {
+		out.ChronoMagicID = traceID.String()
+	}
 
 	if len(problem.PacketstreamData) > 0 {
 		var data struct {

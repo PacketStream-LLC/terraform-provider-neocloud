@@ -95,11 +95,27 @@ func TestParseAPIErrorRendersSanitizedValidationDetails(t *testing.T) {
 	}
 }
 
+func TestParseAPIErrorIncludesChronoMagicTraceID(t *testing.T) {
+	body := []byte(`{
+		"type": "urn:packetstream:problem:validation-error",
+		"status": 400,
+		"detail": "Request data validation failed.",
+		"chronoMagicId": "b585b2b4-e7b5-49ce-86f0-237ac72e59a8"
+	}`)
+
+	apiErr := ParseAPIError(400, body)
+
+	if got, want := apiErr.Error(), "neocloud API error 400 (urn:packetstream:problem:validation-error): Request data validation failed. Trace ID: b585b2b4-e7b5-49ce-86f0-237ac72e59a8"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestParseAPIErrorIgnoresArbitraryProblemExtensions(t *testing.T) {
 	body := []byte(`{
 		"type": "urn:packetstream:problem:validation-error",
 		"status": 400,
 		"detail": "Request data validation failed.",
+		"chronoMagicId": "unsafe-secret",
 		"invalidParams": [{"name": "password", "reason": "unsafe-secret"}],
 		"requestBody": {"password": "unsafe-secret"}
 	}`)
