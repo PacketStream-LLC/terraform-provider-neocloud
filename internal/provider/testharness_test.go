@@ -25,6 +25,7 @@ type mockServer struct {
 	objects        map[string]map[string]map[string]any // base -> id -> object
 	transitions    map[string][]string                  // id -> 남은 상태열 (마지막 값 유지)
 	createStatuses map[string][][]string                // base -> 다음 POST 들에 줄 상태열
+	createExtras   map[string][]map[string]any          // base -> 다음 POST 응답 data 에 덧붙일 필드
 	deleteStatuses map[string][]string                  // base -> DELETE 후 상태열
 	requests       []recordedRequest
 	failures       []plannedFailure
@@ -50,6 +51,7 @@ func newMockServer(t *testing.T) *mockServer {
 		objects:        map[string]map[string]map[string]any{},
 		transitions:    map[string][]string{},
 		createStatuses: map[string][][]string{},
+		createExtras:   map[string][]map[string]any{},
 		deleteStatuses: map[string][]string{},
 	}
 	ms.srv = httptest.NewServer(http.HandlerFunc(ms.handle))
@@ -77,6 +79,15 @@ func (ms *mockServer) createStatus(base string, statuses ...string) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	ms.createStatuses[base] = append(ms.createStatuses[base], statuses)
+}
+
+// createResponseExtra 는 base 의 다음 POST 응답 data 에 필드를 덧붙인다 —
+// 발급 응답에만 실리는 값(object storage user 의 secret 등)을 흉내낸다.
+// 저장된 오브젝트에는 넣지 않으므로 이후 GET 에는 나오지 않는다.
+func (ms *mockServer) createResponseExtra(base string, extra map[string]any) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.createExtras[base] = append(ms.createExtras[base], extra)
 }
 
 // seed 는 이미 존재하는 리소스를 심는다. 반환값은 id.
@@ -182,7 +193,14 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 		obj["status"] = statuses[0]
 		ms.objects[base][newID] = obj
 		ms.transitions[newID] = statuses
-		writeEnvelope(w, 201, map[string]any{"id": newID})
+		created := map[string]any{"id": newID}
+		if q := ms.createExtras[base]; len(q) > 0 {
+			for k, v := range q[0] {
+				created[k] = v
+			}
+			ms.createExtras[base] = q[1:]
+		}
+		writeEnvelope(w, 201, created)
 
 	case r.Method == http.MethodGet && id != "":
 		obj, ok := ms.objects[base][id]
