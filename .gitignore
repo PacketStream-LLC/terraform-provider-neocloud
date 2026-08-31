@@ -3,3 +3,5 @@ dist/
 openapi/generator-input.json
 .terraform/
 *.tfstate*
+
+.idea/
