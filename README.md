@@ -78,14 +78,15 @@ provider_installation {
 
 - Regenerate the API client after the upstream spec changes:
   `./scripts/sync-spec.sh` (reads `../neocloud-api/openapi-specs/neocloud-public.json`,
-  downconverts to OpenAPI 3.0 for oapi-codegen, regenerates `internal/client/gen.go`).
+  keeps public production metadata, downconverts to OpenAPI 3.0 for oapi-codegen,
+  and regenerates `internal/client/gen.go`).
 - Run tests: `go test ./...` — resource tests run against an in-process mock of the
   API (no credentials, no cost).
 - Acceptance tests against a real environment create **billable** resources and run
   only when explicitly armed:
 
   ```
-  TF_ACC=1 NEOCLOUD_API_KEY=sk_nc_... \
+  TF_ACC=1 NEOCLOUD_API_KEY=sk_nc_... NEOCLOUD_ACC_ZONE_ID=<zone-uuid> \
     go test ./internal/provider/ -run TestAcc -timeout 90m
   ```
 

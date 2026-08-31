@@ -2,6 +2,18 @@ terraform-provider-neocloud
 dist/
 openapi/generator-input.json
 .terraform/
+.terraform.lock.hcl
 *.tfstate*
+*.tfvars
+*.tfvars.json
+*.tfplan
+
+.env
+.env.*
+!.env.example
 
 .idea/
+.vscode/
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 
 SRC="${NEOCLOUD_API_REPO:-../neocloud-api}/openapi-specs/neocloud-public.json"
 cp "$SRC" openapi/neocloud-public.json
+python3 scripts/sanitize-public-spec.py openapi/neocloud-public.json
 
 python3 scripts/downconvert-3.0.py openapi/neocloud-public.json openapi/generator-input.json
 
