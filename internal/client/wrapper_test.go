@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,42 @@ func TestParseAPIErrorNonJSON(t *testing.T) {
 	}
 	if e.IsNotFound() {
 		t.Fatal("IsNotFound() on 502")
+	}
+}
+
+func TestParseAPIErrorRendersSanitizedValidationDetails(t *testing.T) {
+	body := []byte(`{
+		"type": "urn:packetstream:problem:validation-error",
+		"status": 400,
+		"detail": "Request data validation failed.",
+		"packetstreamData": {"errors": [
+			{"type": "string_pattern_mismatch", "loc": ["body", "username"], "msg": "String should match pattern", "input": "unsafe-secret"}
+		]}
+	}`)
+
+	apiErr := ParseAPIError(400, body)
+
+	if got, want := apiErr.Error(), "neocloud API error 400 (urn:packetstream:problem:validation-error): Request data validation failed. Validation: username: String should match pattern (string_pattern_mismatch)"; got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if strings.Contains(apiErr.Error(), "unsafe-secret") {
+		t.Fatal("Error() exposed reflected input")
+	}
+}
+
+func TestParseAPIErrorIgnoresArbitraryProblemExtensions(t *testing.T) {
+	body := []byte(`{
+		"type": "urn:packetstream:problem:validation-error",
+		"status": 400,
+		"detail": "Request data validation failed.",
+		"invalidParams": [{"name": "password", "reason": "unsafe-secret"}],
+		"requestBody": {"password": "unsafe-secret"}
+	}`)
+
+	apiErr := ParseAPIError(400, body)
+
+	if strings.Contains(apiErr.Error(), "unsafe-secret") || strings.Contains(apiErr.Error(), "password") {
+		t.Fatal("Error() exposed an unrecognized problem extension")
 	}
 }
 

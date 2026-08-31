@@ -40,16 +40,38 @@ type APIError struct {
 	UpstreamCode       string
 	ResourceStatus     string
 	BucketWidthSeconds int
+	validationIssues   []validationIssue
+}
+
+type validationIssue struct {
+	Path    string
+	Message string
+	Rule    string
 }
 
 func (e *APIError) Error() string {
-	if e.Type != "" {
-		return fmt.Sprintf("neocloud API error %d (%s): %s", e.Status, e.Type, e.Detail)
+	var summary string
+	switch {
+	case e.Type != "":
+		summary = fmt.Sprintf("neocloud API error %d (%s): %s", e.Status, e.Type, e.Detail)
+	case e.Detail != "":
+		summary = fmt.Sprintf("neocloud API error %d: %s", e.Status, e.Detail)
+	default:
+		summary = fmt.Sprintf("neocloud API error %d", e.Status)
 	}
-	if e.Detail != "" {
-		return fmt.Sprintf("neocloud API error %d: %s", e.Status, e.Detail)
+
+	if len(e.validationIssues) == 0 {
+		return summary
 	}
-	return fmt.Sprintf("neocloud API error %d", e.Status)
+	details := make([]string, 0, len(e.validationIssues))
+	for _, issue := range e.validationIssues {
+		detail := issue.Path + ": " + issue.Message
+		if issue.Rule != "" {
+			detail += " (" + issue.Rule + ")"
+		}
+		details = append(details, detail)
+	}
+	return summary + " Validation: " + strings.Join(details, "; ")
 }
 
 const problemTypePrefix = "urn:packetstream:problem:"
@@ -89,10 +111,16 @@ func ParseAPIError(status int, body []byte) *APIError {
 			UpstreamCode   string          `json:"upstreamCode"`
 			ResourceStatus string          `json:"resourceStatus"`
 			BucketWidth    json.RawMessage `json:"bucket_width"`
+			Errors         []struct {
+				Type string `json:"type"`
+				Loc  []any  `json:"loc"`
+				Msg  string `json:"msg"`
+			} `json:"errors"`
 		}
 		if err := json.Unmarshal(problem.PacketstreamData, &data); err == nil {
 			out.UpstreamCode = data.UpstreamCode
 			out.ResourceStatus = data.ResourceStatus
+			out.validationIssues = parseValidationIssues(data.Errors)
 			// 상류 통과 필드라 숫자/문자열이 섞인다 — 어느 쪽이든 초 단위 정수로 읽는다.
 			if len(data.BucketWidth) > 0 {
 				var n int
@@ -109,4 +137,48 @@ func ParseAPIError(status int, body []byte) *APIError {
 		}
 	}
 	return out
+}
+
+func parseValidationIssues(errors []struct {
+	Type string `json:"type"`
+	Loc  []any  `json:"loc"`
+	Msg  string `json:"msg"`
+}) []validationIssue {
+	issues := make([]validationIssue, 0, min(len(errors), 5))
+	for _, validationError := range errors {
+		path := validationPath(validationError.Loc)
+		message := normalizedDiagnosticText(validationError.Msg, 300)
+		if path == "" || message == "" {
+			continue
+		}
+		issues = append(issues, validationIssue{
+			Path: path, Message: message,
+			Rule: normalizedDiagnosticText(validationError.Type, 80),
+		})
+		if len(issues) == 5 {
+			break
+		}
+	}
+	return issues
+}
+
+func validationPath(location []any) string {
+	segments := make([]string, 0, len(location))
+	for _, rawSegment := range location {
+		segment := normalizedDiagnosticText(fmt.Sprint(rawSegment), 80)
+		if segment == "" || (len(segments) == 0 && segment == "body") {
+			continue
+		}
+		segments = append(segments, segment)
+	}
+	return strings.Join(segments, ".")
+}
+
+func normalizedDiagnosticText(value string, maxRunes int) string {
+	normalized := strings.Join(strings.Fields(value), " ")
+	runes := []rune(normalized)
+	if len(runes) <= maxRunes {
+		return normalized
+	}
+	return string(runes[:maxRunes]) + "…"
 }
