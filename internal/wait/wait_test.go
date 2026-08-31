@@ -136,3 +136,20 @@ func TestTimeoutClampedToOneHour(t *testing.T) {
 		t.Fatalf("waited %v beyond 1h hard cap", timeout.Waited)
 	}
 }
+
+func TestRetryableErrorOverridesDefaultClassification(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(0, 0)}
+	want := &client.APIError{Status: 409, Type: "urn:packetstream:problem:resource-transitioning", ResourceStatus: "deleting"}
+	fetch := func(context.Context) (string, *client.APIError) { return "", want }
+
+	err := ForStatus(context.Background(), fetch, Config{
+		Ready: []string{"deleted"}, Timeout: time.Hour, Clock: clock,
+		RetryableError: func(*client.APIError) bool { return false },
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("err = %v, want original API error", err)
+	}
+	if len(clock.sleeps) != 0 {
+		t.Fatalf("sleeps = %v, want none", clock.sleeps)
+	}
+}

@@ -34,10 +34,11 @@ func (realClock) Sleep(ctx context.Context, d time.Duration) error {
 }
 
 type Config struct {
-	Ready    []string
-	Terminal []string
-	Timeout  time.Duration
-	Clock    Clock
+	Ready          []string
+	Terminal       []string
+	Timeout        time.Duration
+	Clock          Clock
+	RetryableError func(*client.APIError) bool
 }
 
 type UnexpectedTerminalError struct{ Status string }
@@ -88,7 +89,9 @@ func ForStatus(ctx context.Context, fetch FetchFunc, cfg Config) error {
 				return nil
 			}
 			return &UnexpectedTerminalError{Status: "404"}
-		case apiErr != nil && (apiErr.IsTransitioning() || apiErr.IsRateLimited()):
+		case apiErr != nil && cfg.RetryableError != nil && cfg.RetryableError(apiErr):
+			// 호출부가 술어를 주면 기본 분류 대신 그 계약을 따른다.
+		case apiErr != nil && cfg.RetryableError == nil && (apiErr.IsTransitioning() || apiErr.IsRateLimited()):
 			// 폴링 중의 일시 상태 — 아래 백오프로 그냥 계속 돈다.
 		case apiErr != nil:
 			return apiErr

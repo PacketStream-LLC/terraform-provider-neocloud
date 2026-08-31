@@ -1,0 +1,17 @@
+---
+page_title: "Provider: Neocloud"
+description: |-
+  Manage PacketStream Neocloud IaaS resources through the customer API.
+---
+
+# Neocloud Provider
+
+Use the Neocloud provider to manage compute, storage, and networking resources.
+
+## Authentication
+
+Set `NEOCLOUD_API_KEY` to a READ_WRITE Neocloud API key. API keys are issued by humans in the Neocloud console and cannot create or revoke other keys. You may set `api_key` in the provider block instead, but environment variables avoid storing credentials in Terraform configuration.
+
+The provider uses `https://neocloud-api.packetstream.us` unless `NEOCLOUD_ENDPOINT` or the `endpoint` attribute overrides it.
+
+{{ .SchemaMarkdown | trimspace }}

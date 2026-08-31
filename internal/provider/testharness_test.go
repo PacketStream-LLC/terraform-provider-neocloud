@@ -21,14 +21,16 @@ type mockServer struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu             sync.Mutex
-	objects        map[string]map[string]map[string]any // base -> id -> object
-	transitions    map[string][]string                  // id -> 남은 상태열 (마지막 값 유지)
-	createStatuses map[string][][]string                // base -> 다음 POST 들에 줄 상태열
-	createExtras   map[string][]map[string]any          // base -> 다음 POST 응답 data 에 덧붙일 필드
-	deleteStatuses map[string][]string                  // base -> DELETE 후 상태열
-	requests       []recordedRequest
-	failures       []plannedFailure
+	mu                     sync.Mutex
+	objects                map[string]map[string]map[string]any // base -> id -> object
+	transitions            map[string][]string                  // id -> 남은 상태열 (마지막 값 유지)
+	createStatuses         map[string][][]string                // base -> 다음 POST 들에 줄 상태열
+	createExtras           map[string][]map[string]any          // base -> 다음 POST 응답 data 에 덧붙일 필드
+	createObjectExtras     map[string][]map[string]any
+	deleteStatuses         map[string][]string
+	requireStatusForDelete map[string]string
+	requests               []recordedRequest
+	failures               []plannedFailure
 }
 
 type recordedRequest struct {
@@ -47,12 +49,14 @@ type plannedFailure struct {
 
 func newMockServer(t *testing.T) *mockServer {
 	ms := &mockServer{
-		t:              t,
-		objects:        map[string]map[string]map[string]any{},
-		transitions:    map[string][]string{},
-		createStatuses: map[string][][]string{},
-		createExtras:   map[string][]map[string]any{},
-		deleteStatuses: map[string][]string{},
+		t:                      t,
+		objects:                map[string]map[string]map[string]any{},
+		transitions:            map[string][]string{},
+		createStatuses:         map[string][][]string{},
+		createExtras:           map[string][]map[string]any{},
+		createObjectExtras:     map[string][]map[string]any{},
+		deleteStatuses:         map[string][]string{},
+		requireStatusForDelete: map[string]string{},
 	}
 	ms.srv = httptest.NewServer(http.HandlerFunc(ms.handle))
 	t.Cleanup(ms.srv.Close)
@@ -75,6 +79,12 @@ func (ms *mockServer) register(base string, deleteStatuses ...string) {
 }
 
 // createStatus 는 base 의 다음 POST 가 만들 리소스의 상태열을 정한다.
+func (ms *mockServer) requireDeleteStatus(base, status string) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.requireStatusForDelete[base] = status
+}
+
 func (ms *mockServer) createStatus(base string, statuses ...string) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
@@ -84,6 +94,12 @@ func (ms *mockServer) createStatus(base string, statuses ...string) {
 // createResponseExtra 는 base 의 다음 POST 응답 data 에 필드를 덧붙인다 —
 // 발급 응답에만 실리는 값(object storage user 의 secret 등)을 흉내낸다.
 // 저장된 오브젝트에는 넣지 않으므로 이후 GET 에는 나오지 않는다.
+func (ms *mockServer) createObjectExtra(base string, extra map[string]any) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.createObjectExtras[base] = append(ms.createObjectExtras[base], extra)
+}
+
 func (ms *mockServer) createResponseExtra(base string, extra map[string]any) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
@@ -191,6 +207,12 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 			ms.createStatuses[base] = q[1:]
 		}
 		obj["status"] = statuses[0]
+		if queuedExtras := ms.createObjectExtras[base]; len(queuedExtras) > 0 {
+			for key, value := range queuedExtras[0] {
+				obj[key] = value
+			}
+			ms.createObjectExtras[base] = queuedExtras[1:]
+		}
 		ms.objects[base][newID] = obj
 		ms.transitions[newID] = statuses
 		created := map[string]any{"id": newID}
@@ -227,12 +249,20 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 			obj[k] = v
 		}
+		if requiredStatus := ms.requireStatusForDelete[base]; requiredStatus != "" && body["alwaysOn"] == false {
+			obj["status"] = requiredStatus
+			ms.transitions[id] = []string{requiredStatus}
+		}
 		writeEnvelope(w, 200, map[string]any{"id": id})
 
 	case r.Method == http.MethodDelete && id != "":
 		obj, ok := ms.objects[base][id]
 		if !ok {
 			writeProblem(w, 404, "urn:packetstream:problem:not-found", nil)
+			return
+		}
+		if requiredStatus := ms.requireStatusForDelete[base]; requiredStatus != "" && obj["status"] != requiredStatus {
+			writeProblem(w, http.StatusConflict, "urn:packetstream:problem:resource-transitioning", map[string]any{"resourceStatus": obj["status"]})
 			return
 		}
 		statuses := ms.deleteStatuses[base]
@@ -302,5 +332,53 @@ provider "neocloud" {
 func protoV6ProviderFactories() map[string]func() (tfprotov6.ProviderServer, error) {
 	return map[string]func() (tfprotov6.ProviderServer, error){
 		"neocloud": providerserver.NewProtocol6WithError(New("test")()),
+	}
+}
+
+func TestMockServerRequiresStatusForDelete(t *testing.T) {
+	ms := newMockServer(t)
+	const base = "/v1/compute/virtual-machines"
+	ms.register(base)
+	ms.requireDeleteStatus(base, "idle")
+	id := ms.seed(base, map[string]any{"alwaysOn": true}, "allocated")
+
+	request, err := http.NewRequest(http.MethodDelete, ms.URL()+base+"/"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("allocated DELETE status = %d, want 409", response.StatusCode)
+	}
+
+	patchBody := strings.NewReader(`{"alwaysOn":false}`)
+	request, err = http.NewRequest(http.MethodPatch, ms.URL()+base+"/"+id, patchBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH status = %d, want 200", response.StatusCode)
+	}
+
+	request, err = http.NewRequest(http.MethodDelete, ms.URL()+base+"/"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("idle DELETE status = %d, want 200", response.StatusCode)
 	}
 }
