@@ -31,6 +31,8 @@ var (
 
 func NewVirtualNetworkResource() resource.Resource { return &virtualNetworkResource{} }
 
+func init() { registerResource(NewVirtualNetworkResource) }
+
 type virtualNetworkModel struct {
 	ID          types.String   `tfsdk:"id"`
 	ZoneID      types.String   `tfsdk:"zone_id"`
