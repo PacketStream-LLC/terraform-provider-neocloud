@@ -21,16 +21,19 @@ type mockServer struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu                     sync.Mutex
-	objects                map[string]map[string]map[string]any // base -> id -> object
-	transitions            map[string][]string                  // id -> 남은 상태열 (마지막 값 유지)
-	createStatuses         map[string][][]string                // base -> 다음 POST 들에 줄 상태열
-	createExtras           map[string][]map[string]any          // base -> 다음 POST 응답 data 에 덧붙일 필드
-	createObjectExtras     map[string][]map[string]any
-	deleteStatuses         map[string][]string
-	requireStatusForDelete map[string]string
-	requests               []recordedRequest
-	failures               []plannedFailure
+	mu                       sync.Mutex
+	objects                  map[string]map[string]map[string]any // base -> id -> object
+	transitions              map[string][]string                  // id -> 남은 상태열 (마지막 값 유지)
+	createStatuses           map[string][][]string                // base -> 다음 POST 들에 줄 상태열
+	createExtras             map[string][]map[string]any          // base -> 다음 POST 응답 data 에 덧붙일 필드
+	createObjectExtras       map[string][]map[string]any
+	deleteStatuses           map[string][]string
+	requireStatusForDelete   map[string]string
+	requireDetachedForDelete map[string]string
+	detachStatuses           map[string][]string
+	detachConfirmed          map[string]bool
+	requests                 []recordedRequest
+	failures                 []plannedFailure
 }
 
 type recordedRequest struct {
@@ -49,14 +52,17 @@ type plannedFailure struct {
 
 func newMockServer(t *testing.T) *mockServer {
 	ms := &mockServer{
-		t:                      t,
-		objects:                map[string]map[string]map[string]any{},
-		transitions:            map[string][]string{},
-		createStatuses:         map[string][][]string{},
-		createExtras:           map[string][]map[string]any{},
-		createObjectExtras:     map[string][]map[string]any{},
-		deleteStatuses:         map[string][]string{},
-		requireStatusForDelete: map[string]string{},
+		t:                        t,
+		objects:                  map[string]map[string]map[string]any{},
+		transitions:              map[string][]string{},
+		createStatuses:           map[string][][]string{},
+		createExtras:             map[string][]map[string]any{},
+		createObjectExtras:       map[string][]map[string]any{},
+		deleteStatuses:           map[string][]string{},
+		requireStatusForDelete:   map[string]string{},
+		requireDetachedForDelete: map[string]string{},
+		detachStatuses:           map[string][]string{},
+		detachConfirmed:          map[string]bool{},
 	}
 	ms.srv = httptest.NewServer(http.HandlerFunc(ms.handle))
 	t.Cleanup(ms.srv.Close)
@@ -83,6 +89,13 @@ func (ms *mockServer) requireDeleteStatus(base, status string) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	ms.requireStatusForDelete[base] = status
+}
+
+func (ms *mockServer) requireDetachForDelete(base string, statuses ...string) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.requireDetachedForDelete[base] = statuses[len(statuses)-1]
+	ms.detachStatuses[base] = statuses
 }
 
 func (ms *mockServer) createStatus(base string, statuses ...string) {
@@ -234,6 +247,10 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 			ms.transitions[id] = tr[1:]
 			obj["status"] = tr[1]
 		}
+		if _, required := ms.requireDetachedForDelete[base]; required {
+			_, attached := obj["attachedMachineId"]
+			ms.detachConfirmed[id] = !attached && obj["status"] == ms.requireDetachedForDelete[base]
+		}
 		writeEnvelope(w, 200, obj)
 
 	case r.Method == http.MethodPatch && id != "":
@@ -249,6 +266,13 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 			}
 			obj[k] = v
 		}
+		if value, ok := body["attachedMachineId"]; ok && value == nil {
+			if statuses := ms.detachStatuses[base]; len(statuses) > 0 {
+				obj["status"] = statuses[0]
+				ms.transitions[id] = statuses
+				ms.detachConfirmed[id] = false
+			}
+		}
 		if requiredStatus := ms.requireStatusForDelete[base]; requiredStatus != "" && body["alwaysOn"] == false {
 			obj["status"] = requiredStatus
 			ms.transitions[id] = []string{requiredStatus}
@@ -259,6 +283,14 @@ func (ms *mockServer) handle(w http.ResponseWriter, r *http.Request) {
 		obj, ok := ms.objects[base][id]
 		if !ok {
 			writeProblem(w, 404, "urn:packetstream:problem:not-found", nil)
+			return
+		}
+		if _, attached := obj["attachedMachineId"]; attached {
+			writeProblem(w, http.StatusConflict, "urn:packetstream:problem:resource-in-use", nil)
+			return
+		}
+		if _, required := ms.requireDetachedForDelete[base]; required && !ms.detachConfirmed[id] {
+			writeProblem(w, http.StatusConflict, "urn:packetstream:problem:resource-transitioning", map[string]any{"resourceStatus": obj["status"]})
 			return
 		}
 		if requiredStatus := ms.requireStatusForDelete[base]; requiredStatus != "" && obj["status"] != requiredStatus {
@@ -380,5 +412,80 @@ func TestMockServerRequiresStatusForDelete(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("idle DELETE status = %d, want 200", response.StatusCode)
+	}
+}
+
+func (ms *mockServer) assertDetachedDelete(base string) {
+	ms.t.Helper()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	lastPatch := -1
+	deleteIndex := -1
+	for i, request := range ms.requests {
+		if !strings.HasPrefix(request.Path, base+"/") {
+			continue
+		}
+		switch request.Method {
+		case http.MethodPatch:
+			lastPatch = i
+		case http.MethodDelete:
+			deleteIndex = i
+		}
+	}
+	if lastPatch < 0 || deleteIndex < 0 || lastPatch >= deleteIndex {
+		ms.t.Fatalf("requests = %v, want detach PATCH before DELETE", ms.requests)
+	}
+	body := ms.requests[lastPatch].Body
+	if value, ok := body["attachedMachineId"]; !ok || value != nil || len(body) != 1 {
+		ms.t.Fatalf("detach PATCH body = %v, want only attachedMachineId=null", body)
+	}
+	for _, request := range ms.requests[lastPatch+1 : deleteIndex] {
+		if request.Method == http.MethodGet {
+			return
+		}
+	}
+	ms.t.Fatalf("requests = %v, want confirming GET between detach PATCH and DELETE", ms.requests)
+}
+
+func TestMockServerRequiresConfirmedDetachForDelete(t *testing.T) {
+	ms := newMockServer(t)
+	const base = "/v1/network/network-interfaces"
+	ms.register(base)
+	ms.requireDetachForDelete(base, "detaching", "active")
+	id := ms.seed(base, map[string]any{"attachedMachineId": uuid.NewString()}, "active")
+
+	request := func(method, body string) *http.Response {
+		t.Helper()
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, ms.URL()+base+"/"+id, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { response.Body.Close() })
+		return response
+	}
+
+	if got := request(http.MethodDelete, "").StatusCode; got != http.StatusConflict {
+		t.Fatalf("attached DELETE status = %d, want 409", got)
+	}
+	if got := request(http.MethodPatch, `{"attachedMachineId":null}`).StatusCode; got != http.StatusOK {
+		t.Fatalf("detach PATCH status = %d, want 200", got)
+	}
+	if got := request(http.MethodDelete, "").StatusCode; got != http.StatusConflict {
+		t.Fatalf("unconfirmed DELETE status = %d, want 409", got)
+	}
+	if got := request(http.MethodGet, "").StatusCode; got != http.StatusOK {
+		t.Fatalf("confirming GET status = %d, want 200", got)
+	}
+	if got := request(http.MethodDelete, "").StatusCode; got != http.StatusOK {
+		t.Fatalf("detached DELETE status = %d, want 200", got)
 	}
 }

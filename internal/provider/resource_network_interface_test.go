@@ -149,3 +149,19 @@ func TestNetworkInterfaceDisappearsViaDeletedStatus(t *testing.T) {
 		},
 	})
 }
+
+func TestNetworkInterfaceDeleteDetachesAttachedMachine(t *testing.T) {
+	ms := newMockServer(t)
+	ms.register(nicBase)
+	ms.requireDetachForDelete(nicBase, "detaching", "detaching", "active")
+	ms.createStatus(nicBase, "active")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config: nicConfig(ms, "nic-attached-delete", nicMachineID),
+		}},
+	})
+
+	ms.assertDetachedDelete(nicBase)
+}

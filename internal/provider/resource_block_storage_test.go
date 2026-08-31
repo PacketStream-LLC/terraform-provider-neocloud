@@ -174,3 +174,21 @@ func TestBlockStorageDisappearsViaDeletedStatus(t *testing.T) {
 		},
 	})
 }
+
+func TestBlockStorageDeleteDetachesAttachedMachine(t *testing.T) {
+	ms := newMockServer(t)
+	ms.register(bsBase)
+	ms.requireDetachForDelete(bsBase, "detaching", "detaching", "prepared")
+	ms.createStatus(bsBase, "prepared")
+
+	const machineID = "b2f5c8d1-3e4a-4b5c-8d6e-7f8091a2b3c4"
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config: bsConfig(ms, "bs-attached-delete", 50,
+				fmt.Sprintf("  attached_machine_id = %q\n", machineID)),
+		}},
+	})
+
+	ms.assertDetachedDelete(bsBase)
+}

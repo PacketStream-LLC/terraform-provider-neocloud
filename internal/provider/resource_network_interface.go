@@ -378,6 +378,68 @@ func (r *networkInterfaceResource) Update(ctx context.Context, req resource.Upda
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
+func (r *networkInterfaceResource) prepareDelete(ctx context.Context, id openapi_types.UUID, timeout time.Duration, diags *diag.Diagnostics) bool {
+	res, err := r.api.Raw().GetNetworkInterfaceWithResponse(ctx, id)
+	if err != nil {
+		addAPIError(diags, "Failed to read network interface before delete", transportAPIError(err))
+		return false
+	}
+	if res.JSON200 == nil || res.JSON200.Data == nil {
+		apiErr := client.ParseAPIError(res.StatusCode(), res.Body)
+		if apiErr.IsNotFound() {
+			return false
+		}
+		addAPIError(diags, "Failed to read network interface before delete", apiErr)
+		return false
+	}
+	dto, err := res.JSON200.Data.AsNetworkInterfaceDto()
+	if err != nil {
+		addAPIError(diags, "Failed to decode network interface before delete", transportAPIError(err))
+		return false
+	}
+	if terminalStatus(string(dto.Status)) {
+		return false
+	}
+	if dto.AttachedMachineId != nil && !r.patchRaw(ctx, id, map[string]any{"attachedMachineId": nil}, diags) {
+		return false
+	}
+
+	gone := false
+	fetch := func(ctx context.Context) (string, *client.APIError) {
+		res, err := r.api.Raw().GetNetworkInterfaceWithResponse(ctx, id)
+		if err != nil {
+			return "", transportAPIError(err)
+		}
+		if res.JSON200 == nil || res.JSON200.Data == nil {
+			apiErr := client.ParseAPIError(res.StatusCode(), res.Body)
+			if apiErr.IsNotFound() {
+				gone = true
+			}
+			return "", apiErr
+		}
+		dto, err := res.JSON200.Data.AsNetworkInterfaceDto()
+		if err != nil {
+			return "", transportAPIError(err)
+		}
+		status := string(dto.Status)
+		if terminalStatus(status) {
+			gone = true
+			return status, nil
+		}
+		if dto.AttachedMachineId == nil && status == "active" {
+			return "delete-ready", nil
+		}
+		return status, nil
+	}
+	if err := wait.ForStatus(ctx, fetch, wait.Config{
+		Ready: []string{"delete-ready", "deleted", "terminated"}, Timeout: timeout,
+	}); err != nil {
+		diags.AddError("Network interface did not detach before delete", err.Error())
+		return false
+	}
+	return !gone
+}
+
 func (r *networkInterfaceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state networkInterfaceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -390,6 +452,10 @@ func (r *networkInterfaceResource) Delete(ctx context.Context, req resource.Dele
 
 	id, err := uuid.Parse(state.ID.ValueString())
 	if err != nil {
+		return
+	}
+
+	if !r.prepareDelete(ctx, id, deleteTimeout, &resp.Diagnostics) {
 		return
 	}
 

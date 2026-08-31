@@ -379,6 +379,90 @@ func (r *blockStorageResource) Update(ctx context.Context, req resource.UpdateRe
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
+func (r *blockStorageResource) detachForDelete(ctx context.Context, id openapi_types.UUID, diags *diag.Diagnostics) bool {
+	raw, err := json.Marshal(map[string]any{"attachedMachineId": nil})
+	if err != nil {
+		diags.AddError("Failed to encode block storage detach", err.Error())
+		return false
+	}
+	res, err := r.api.Raw().UpdateBlockStorageWithBodyWithResponse(ctx, id, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		addAPIError(diags, "Failed to detach block storage before delete", transportAPIError(err))
+		return false
+	}
+	if res.JSON200 == nil {
+		apiErr := client.ParseAPIError(res.StatusCode(), res.Body)
+		if apiErr.IsNotFound() {
+			return false
+		}
+		addAPIError(diags, "Failed to detach block storage before delete", apiErr)
+		return false
+	}
+	return true
+}
+
+func (r *blockStorageResource) prepareDelete(ctx context.Context, id openapi_types.UUID, timeout time.Duration, diags *diag.Diagnostics) bool {
+	res, err := r.api.Raw().GetBlockStorageWithResponse(ctx, id)
+	if err != nil {
+		addAPIError(diags, "Failed to read block storage before delete", transportAPIError(err))
+		return false
+	}
+	if res.JSON200 == nil || res.JSON200.Data == nil {
+		apiErr := client.ParseAPIError(res.StatusCode(), res.Body)
+		if apiErr.IsNotFound() {
+			return false
+		}
+		addAPIError(diags, "Failed to read block storage before delete", apiErr)
+		return false
+	}
+	dto, err := res.JSON200.Data.AsBlockStorageDto()
+	if err != nil {
+		addAPIError(diags, "Failed to decode block storage before delete", transportAPIError(err))
+		return false
+	}
+	if terminalStatus(string(dto.Status)) {
+		return false
+	}
+	if dto.AttachedMachineId != nil && !r.detachForDelete(ctx, id, diags) {
+		return false
+	}
+
+	gone := false
+	fetch := func(ctx context.Context) (string, *client.APIError) {
+		res, err := r.api.Raw().GetBlockStorageWithResponse(ctx, id)
+		if err != nil {
+			return "", transportAPIError(err)
+		}
+		if res.JSON200 == nil || res.JSON200.Data == nil {
+			apiErr := client.ParseAPIError(res.StatusCode(), res.Body)
+			if apiErr.IsNotFound() {
+				gone = true
+			}
+			return "", apiErr
+		}
+		dto, err := res.JSON200.Data.AsBlockStorageDto()
+		if err != nil {
+			return "", transportAPIError(err)
+		}
+		status := string(dto.Status)
+		if terminalStatus(status) {
+			gone = true
+			return status, nil
+		}
+		if dto.AttachedMachineId == nil && status == "prepared" {
+			return "delete-ready", nil
+		}
+		return status, nil
+	}
+	if err := wait.ForStatus(ctx, fetch, wait.Config{
+		Ready: []string{"delete-ready", "deleted", "terminated"}, Timeout: timeout,
+	}); err != nil {
+		diags.AddError("Block storage did not detach before delete", err.Error())
+		return false
+	}
+	return !gone
+}
+
 func (r *blockStorageResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state blockStorageModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -391,6 +475,10 @@ func (r *blockStorageResource) Delete(ctx context.Context, req resource.DeleteRe
 
 	id, err := uuid.Parse(state.ID.ValueString())
 	if err != nil {
+		return
+	}
+
+	if !r.prepareDelete(ctx, id, deleteTimeout, &resp.Diagnostics) {
 		return
 	}
 
