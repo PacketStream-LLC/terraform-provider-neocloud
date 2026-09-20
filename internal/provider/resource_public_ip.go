@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,15 +38,16 @@ func NewPublicIpResource() resource.Resource { return &publicIpResource{} }
 func init() { registerResource(NewPublicIpResource) }
 
 type publicIpModel struct {
-	ID        types.String   `tfsdk:"id"`
-	ZoneID    types.String   `tfsdk:"zone_id"`
-	Dr        types.Bool     `tfsdk:"dr"`
-	Ddos      types.Bool     `tfsdk:"ddos"`
-	PricingID types.String   `tfsdk:"pricing_id"`
-	IP        types.String   `tfsdk:"ip"`
-	Tags      types.Map      `tfsdk:"tags"`
-	Status    types.String   `tfsdk:"status"`
-	Timeouts  timeouts.Value `tfsdk:"timeouts"`
+	ID                         types.String   `tfsdk:"id"`
+	ZoneID                     types.String   `tfsdk:"zone_id"`
+	Dr                         types.Bool     `tfsdk:"dr"`
+	Ddos                       types.Bool     `tfsdk:"ddos"`
+	PricingID                  types.String   `tfsdk:"pricing_id"`
+	AttachedNetworkInterfaceID types.String   `tfsdk:"attached_network_interface_id"`
+	IP                         types.String   `tfsdk:"ip"`
+	Tags                       types.Map      `tfsdk:"tags"`
+	Status                     types.String   `tfsdk:"status"`
+	Timeouts                   timeouts.Value `tfsdk:"timeouts"`
 }
 
 func (r *publicIpResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -53,7 +56,7 @@ func (r *publicIpResource) Metadata(_ context.Context, req resource.MetadataRequ
 
 func (r *publicIpResource) Schema(ctx context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A public IP address.",
+		MarkdownDescription: "A public IP address. `attached_network_interface_id` attaches (value) or detaches (null) the address to a network interface in place; detaching does not stop billing, only destroying the address does.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:      true,
@@ -75,7 +78,11 @@ func (r *publicIpResource) Schema(ctx context.Context, _ resource.SchemaRequest,
 				MarkdownDescription: "DDoS protection. false 는 상류 미보호 풀이 비어 있어 409 로 실패한다.",
 			},
 			"pricing_id": schema.StringAttribute{Required: true},
-			"ip":         schema.StringAttribute{Computed: true},
+			"attached_network_interface_id": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Network interface this address is attached to. Omitting the argument means detached, not \"leave as is\": removing it from the configuration sends an explicit detach, and an attachment made outside Terraform shows up as drift on the next refresh. Detaching does not stop billing — only destroying the address does.",
+			},
+			"ip": schema.StringAttribute{Computed: true},
 			"tags": schema.MapAttribute{
 				ElementType: types.StringType,
 				Optional:    true,
@@ -140,6 +147,11 @@ func (r *publicIpResource) readInto(ctx context.Context, id openapi_types.UUID, 
 	} else {
 		model.PricingID = types.StringNull()
 	}
+	if dto.AttachedNetworkInterfaceId != nil {
+		model.AttachedNetworkInterfaceID = types.StringValue(dto.AttachedNetworkInterfaceId.String())
+	} else {
+		model.AttachedNetworkInterfaceID = types.StringNull()
+	}
 	model.IP = types.StringValue(dto.Ip)
 	model.Tags = tagsFromAPI(ctx, dto.Tags, diags)
 	model.Status = types.StringValue(string(dto.Status))
@@ -201,6 +213,18 @@ func (r *publicIpResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
+	// 생성 요청에는 attachedNetworkInterfaceId 자리가 없다 — 생성 시점 연결은 활성화 후 PATCH 로 잇는다.
+	if !plan.AttachedNetworkInterfaceID.IsNull() && !plan.AttachedNetworkInterfaceID.IsUnknown() {
+		nicID, err := uuid.Parse(plan.AttachedNetworkInterfaceID.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("attached_network_interface_id"), "Invalid UUID", err.Error())
+			return
+		}
+		if !r.patchTyped(ctx, created.Id, client.PublicIpUpdateRequest{AttachedNetworkInterfaceId: &nicID}, &resp.Diagnostics) {
+			return
+		}
+	}
+
 	if !r.readInto(ctx, created.Id, &plan, &resp.Diagnostics) {
 		if !resp.Diagnostics.HasError() {
 			resp.Diagnostics.AddError("Public IP vanished after create", created.Id.String())
@@ -231,6 +255,39 @@ func (r *publicIpResource) Read(ctx context.Context, req resource.ReadRequest, r
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
+func (r *publicIpResource) patchTyped(ctx context.Context, id openapi_types.UUID, body client.PublicIpUpdateRequest, diags *diag.Diagnostics) bool {
+	res, err := r.api.Raw().UpdatePublicIpWithResponse(ctx, id, body)
+	if err != nil {
+		addAPIError(diags, "Failed to update public IP", transportAPIError(err))
+		return false
+	}
+	if res.JSON200 == nil {
+		addAPIError(diags, "Failed to update public IP", client.ParseAPIError(res.StatusCode(), res.Body))
+		return false
+	}
+	return true
+}
+
+// patchRaw 는 detach 전용이다 — 생성 타입의 attachedNetworkInterfaceId 는 omitempty 포인터라
+// 명시적 null 을 실을 수 없다.
+func (r *publicIpResource) patchRaw(ctx context.Context, id openapi_types.UUID, body map[string]any, diags *diag.Diagnostics) bool {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		diags.AddError("Failed to encode update body", err.Error())
+		return false
+	}
+	res, err := r.api.Raw().UpdatePublicIpWithBodyWithResponse(ctx, id, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		addAPIError(diags, "Failed to update public IP", transportAPIError(err))
+		return false
+	}
+	if res.JSON200 == nil {
+		addAPIError(diags, "Failed to update public IP", client.ParseAPIError(res.StatusCode(), res.Body))
+		return false
+	}
+	return true
+}
+
 func (r *publicIpResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state publicIpModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -245,30 +302,53 @@ func (r *publicIpResource) Update(ctx context.Context, req resource.UpdateReques
 		return
 	}
 
-	body := client.PublicIpUpdateRequest{}
+	var pricingID *openapi_types.UUID
 	if !plan.PricingID.Equal(state.PricingID) {
-		pricingID, parseErr := uuid.Parse(plan.PricingID.ValueString())
+		parsed, parseErr := uuid.Parse(plan.PricingID.ValueString())
 		if parseErr != nil {
 			resp.Diagnostics.AddAttributeError(path.Root("pricing_id"), "Invalid UUID", parseErr.Error())
 			return
 		}
-		body.PricingId = &pricingID
-	}
-	if !plan.Tags.Equal(state.Tags) {
-		body.Tags = tagsToAPI(ctx, plan.Tags, &resp.Diagnostics)
-	}
-	if resp.Diagnostics.HasError() {
-		return
+		pricingID = &parsed
 	}
 
-	res, err := r.api.Raw().UpdatePublicIpWithResponse(ctx, id, body)
-	if err != nil {
-		addAPIError(&resp.Diagnostics, "Failed to update public IP", transportAPIError(err))
-		return
-	}
-	if res.JSON200 == nil {
-		addAPIError(&resp.Diagnostics, "Failed to update public IP", client.ParseAPIError(res.StatusCode(), res.Body))
-		return
+	detach := plan.AttachedNetworkInterfaceID.IsNull() && !state.AttachedNetworkInterfaceID.IsNull()
+
+	if detach {
+		body := map[string]any{"attachedNetworkInterfaceId": nil}
+		if pricingID != nil {
+			body["pricingId"] = pricingID.String()
+		}
+		if !plan.Tags.Equal(state.Tags) {
+			if tags := tagsToAPI(ctx, plan.Tags, &resp.Diagnostics); tags != nil {
+				body["tags"] = *tags
+			}
+		}
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !r.patchRaw(ctx, id, body, &resp.Diagnostics) {
+			return
+		}
+	} else {
+		body := client.PublicIpUpdateRequest{PricingId: pricingID}
+		if !plan.Tags.Equal(state.Tags) {
+			body.Tags = tagsToAPI(ctx, plan.Tags, &resp.Diagnostics)
+		}
+		if !plan.AttachedNetworkInterfaceID.IsNull() && !plan.AttachedNetworkInterfaceID.Equal(state.AttachedNetworkInterfaceID) {
+			nicID, parseErr := uuid.Parse(plan.AttachedNetworkInterfaceID.ValueString())
+			if parseErr != nil {
+				resp.Diagnostics.AddAttributeError(path.Root("attached_network_interface_id"), "Invalid UUID", parseErr.Error())
+				return
+			}
+			body.AttachedNetworkInterfaceId = &nicID
+		}
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !r.patchTyped(ctx, id, body, &resp.Diagnostics) {
+			return
+		}
 	}
 
 	if !r.readInto(ctx, id, &plan, &resp.Diagnostics) {

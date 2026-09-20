@@ -16,13 +16,21 @@ const (
 )
 
 func publicIpConfig(ms *mockServer, pricingID string) string {
+	return publicIpConfigAttached(ms, pricingID, "")
+}
+
+func publicIpConfigAttached(ms *mockServer, pricingID, nicID string) string {
+	attach := ""
+	if nicID != "" {
+		attach = fmt.Sprintf("\n  attached_network_interface_id = %q", nicID)
+	}
 	return ms.providerConfig() + fmt.Sprintf(`
 resource "neocloud_public_ip" "test" {
   zone_id    = "0a89d6fa-8588-4994-a6d6-a7c3dc5d5ad0"
   dr         = false
-  pricing_id = %q
+  pricing_id = %q%s
 }
-`, pricingID)
+`, pricingID, attach)
 }
 
 func TestPublicIpLifecycle(t *testing.T) {
@@ -108,6 +116,147 @@ func TestPublicIpDisappearsViaDeletedStatus(t *testing.T) {
 					}
 					return nil
 				},
+			},
+		},
+	})
+}
+
+const publicIpNicID = "c1d2e3f4-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
+
+func TestPublicIpAttachDetachNetworkInterface(t *testing.T) {
+	ms := newMockServer(t)
+	ms.register(publicIpBase)
+	ms.createStatus(publicIpBase, "creating", "active")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				// 생성 요청에는 연결 자리가 없다 — active 가 된 뒤 PATCH 로 이어야 한다.
+				Config: publicIpConfigAttached(ms, publicIpPricingA, publicIpNicID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("neocloud_public_ip.test", "attached_network_interface_id", publicIpNicID),
+					func(*terraform.State) error {
+						post := ms.lastBody("POST", "")
+						if _, ok := post["attachedNetworkInterfaceId"]; ok {
+							return fmt.Errorf("생성 요청에 attachedNetworkInterfaceId 가 실렸다: %v", post)
+						}
+						patch := ms.lastBody("PATCH", "")
+						if patch == nil {
+							return fmt.Errorf("PATCH 요청이 기록되지 않았다")
+						}
+						if patch["attachedNetworkInterfaceId"] != publicIpNicID {
+							return fmt.Errorf("PATCH body = %v, want attachedNetworkInterfaceId=%s", patch, publicIpNicID)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// detach: config 에서 빼면 명시적 null 이 실려야 한다 (omitempty 로 빠지면 연결이 유지된다).
+				Config: publicIpConfigAttached(ms, publicIpPricingA, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("neocloud_public_ip.test", "attached_network_interface_id"),
+					func(*terraform.State) error {
+						patch := ms.lastBody("PATCH", "")
+						if patch == nil {
+							return fmt.Errorf("PATCH 요청이 기록되지 않았다")
+						}
+						v, ok := patch["attachedNetworkInterfaceId"]
+						if !ok {
+							return fmt.Errorf("detach PATCH 에 attachedNetworkInterfaceId 키가 없다 (omitempty 로 빠졌다): %v", patch)
+						}
+						if v != nil {
+							return fmt.Errorf("detach PATCH 의 attachedNetworkInterfaceId 가 null 이 아니다: %v", patch)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// 무관 필드만 바꾸면 키 자체가 없어야 한다 — 실리면 연결이 끊긴다(api-findings §14-c).
+				Config: publicIpConfigAttached(ms, publicIpPricingB, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("neocloud_public_ip.test", "pricing_id", publicIpPricingB),
+					func(*terraform.State) error {
+						patch := ms.lastBody("PATCH", "")
+						if patch["pricingId"] != publicIpPricingB {
+							return fmt.Errorf("PATCH body = %v, want pricingId=%s", patch, publicIpPricingB)
+						}
+						if _, ok := patch["attachedNetworkInterfaceId"]; ok {
+							return fmt.Errorf("변경 없는 attachedNetworkInterfaceId 가 PATCH 에 실렸다: %v", patch)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// 재연결도 같은 경로여야 한다.
+				Config: publicIpConfigAttached(ms, publicIpPricingB, publicIpNicID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("neocloud_public_ip.test", "attached_network_interface_id", publicIpNicID),
+					func(*terraform.State) error {
+						patch := ms.lastBody("PATCH", "")
+						if patch["attachedNetworkInterfaceId"] != publicIpNicID {
+							return fmt.Errorf("PATCH body = %v, want attachedNetworkInterfaceId=%s", patch, publicIpNicID)
+						}
+						if _, ok := patch["pricingId"]; ok {
+							return fmt.Errorf("변경 없는 pricingId 가 PATCH 에 실렸다: %v", patch)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// 해제와 단가 변경이 겹치면 raw 바디 하나에 둘 다 실려야 한다.
+				Config: publicIpConfigAttached(ms, publicIpPricingA, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("neocloud_public_ip.test", "attached_network_interface_id"),
+					resource.TestCheckResourceAttr("neocloud_public_ip.test", "pricing_id", publicIpPricingA),
+					func(*terraform.State) error {
+						patch := ms.lastBody("PATCH", "")
+						v, ok := patch["attachedNetworkInterfaceId"]
+						if !ok || v != nil {
+							return fmt.Errorf("PATCH body = %v, want attachedNetworkInterfaceId=null", patch)
+						}
+						if patch["pricingId"] != publicIpPricingA {
+							return fmt.Errorf("PATCH body = %v, want pricingId=%s", patch, publicIpPricingA)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				ResourceName:            "neocloud_public_ip.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"timeouts"},
+			},
+		},
+	})
+}
+
+// 콘솔에서 연결을 끊으면 다음 refresh 가 그것을 드리프트로 보여야 한다.
+func TestPublicIpAttachmentDriftIsDetected(t *testing.T) {
+	ms := newMockServer(t)
+	ms.register(publicIpBase)
+
+	var id string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: publicIpConfigAttached(ms, publicIpPricingA, publicIpNicID),
+				Check: func(s *terraform.State) error {
+					id = s.RootModule().Resources["neocloud_public_ip.test"].Primary.ID
+					return nil
+				},
+			},
+			{
+				PreConfig:          func() { delete(ms.object(publicIpBase, id), "attachedNetworkInterfaceId") },
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check:              resource.TestCheckNoResourceAttr("neocloud_public_ip.test", "attached_network_interface_id"),
 			},
 		},
 	})
